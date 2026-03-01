@@ -270,6 +270,13 @@ tr:hover td{background:var(--surface2);}
   <span class="fx-status" id="fx-status">Loading FX rate&hellip;</span>
   <span class="fx-rate" id="fx-display"></span>
   <button class="btn btn-ghost" onclick="refreshFX()" style="padding:5px 12px;font-size:10px;margin-left:4px;">&#x27F3; Refresh Rate</button>
+  <div class="sep"></div>
+  <span class="cbar-label" style="margin-left:8px">Worker URL</span>
+  <input type="text" id="worker-url-input" placeholder="https://my-proxy.my-name.workers.dev"
+    style="font-size:10px;padding:3px 8px;border:1px solid var(--border);background:var(--surface2);color:var(--text);width:280px;font-family:monospace"
+    oninput="saveWorkerUrl(this.value)">
+  <a href="https://workers.cloudflare.com" target="_blank"
+    style="font-size:9px;color:var(--muted);text-decoration:none;white-space:nowrap">Deploy free Worker ↗</a>
 </div>
 
 <!-- DATA TOOLBAR -->
@@ -388,14 +395,17 @@ tr:hover td{background:var(--surface2);}
     </table>
   </div>
 
-  <div class="charts-row-3">
+  <div class="charts-row">
+    <div class="chart-box"><div class="chart-box-title">Holdings Allocation by Stock / Fund</div><canvas id="chart-fam-ticker" height="230"></canvas></div>
     <div class="chart-box"><div class="chart-box-title">Allocation by Member</div><canvas id="chart-fam-donut" height="230"></canvas></div>
+  </div>
+  <div class="charts-row-3">
     <div class="chart-box"><div class="chart-box-title">Allocation by Account Type</div><canvas id="chart-fam-acct" height="230"></canvas></div>
     <div class="chart-box"><div class="chart-box-title">Allocation by Currency</div><canvas id="chart-fam-cur" height="230"></canvas></div>
+    <div class="chart-box"><div class="chart-box-title">Return by Account Type (%)</div><canvas id="chart-fam-acct-bar" height="230"></canvas></div>
   </div>
   <div class="charts-row">
     <div class="chart-box"><div class="chart-box-title">Return by Member (%)</div><canvas id="chart-fam-bar" height="230"></canvas></div>
-    <div class="chart-box"><div class="chart-box-title">Return by Account Type (%)</div><canvas id="chart-fam-acct-bar" height="230"></canvas></div>
   </div>
 
   <div class="note" id="family-note" style="display:none">
@@ -416,6 +426,14 @@ var CURRENCIES = ['CAD','USD'];
 var INSTITUTIONS = ['Royal Bank of Canada (RBC)','CIBC','WealthSimple','TD Bank','Scotiabank','BMO','Questrade','Other'];
 var ACCT_COLORS = {'RRSP':'#2b5f90','TFSA':'#1f7a5a','Non-Registered':'#9a6b10'};
 var ACCT_CSS    = {'RRSP':'rrsp','TFSA':'tfsa','Non-Registered':'nr'};
+// Distinct palette for ticker allocation charts (20 colours)
+var TICKER_COLORS = [
+  '#2563EB','#16A34A','#DC2626','#D97706','#7C3AED',
+  '#0891B2','#BE185D','#65A30D','#EA580C','#4F46E5',
+  '#0284C7','#15803D','#B91C1C','#B45309','#6D28D9',
+  '#0E7490','#9D174D','#4D7C0F','#C2410C','#4338CA'
+];
+
 var INST_COLORS = ['#5a3a90','#9a6b10','#1f7a5a','#903070','#2b5f90','#aa2828','#1a6e3c','#6a6060'];
 var CUR_COLORS  = {'CAD':'#9a6b10','USD':'#2b5f90'};
 var FAM_COLOR   = '#5a3a90';
@@ -440,6 +458,21 @@ var charts = {};
 var currentTab = 'setup';
 
 // ─── Persistence ───────────────────────────────────────
+function saveWorkerUrl(val) {
+  WORKER_URL = val.trim();
+  try { localStorage.setItem('portfolioWorkerUrl', WORKER_URL); } catch(e) {}
+}
+function loadWorkerUrl() {
+  try {
+    var saved = localStorage.getItem('portfolioWorkerUrl');
+    if (saved) {
+      WORKER_URL = saved;
+      var el = document.getElementById('worker-url-input');
+      if (el) el.value = saved;
+    }
+  } catch(e) {}
+}
+
 function loadState() {
   try {
     var s = localStorage.getItem('familyPortfolioV4');
@@ -470,33 +503,13 @@ function saveState() {
 // ═══════════════════════════════════════════════════════
 //  FX RATE  (USD → CAD)
 // ═══════════════════════════════════════════════════════
-// Chain all three FX sources; on total failure use hardcoded fallback
+// FX rate fetch — routes through Worker proxy with fallbacks
 function fetchFXRate() {
-  // Source 1: open.er-api.com
-  return fetch('https://open.er-api.com/v6/latest/USD')
-    .then(function(r) { if (!r.ok) throw new Error(); return r.json(); })
+  return proxyFetch('https://open.er-api.com/v6/latest/USD')
     .then(function(d) { if (!d.rates||!d.rates.CAD) throw new Error(); return d.rates.CAD; })
-    // Source 2: frankfurter.app
     .catch(function() {
-      return fetch('https://api.frankfurter.app/latest?from=USD&to=CAD')
-        .then(function(r) { if (!r.ok) throw new Error(); return r.json(); })
+      return proxyFetch('https://api.frankfurter.app/latest?from=USD&to=CAD')
         .then(function(d) { if (!d.rates||!d.rates.CAD) throw new Error(); return d.rates.CAD; });
-    })
-    // Source 3: frankfurter via corsproxy
-    .catch(function() {
-      return fetch('https://corsproxy.io/?' + encodeURIComponent('https://api.frankfurter.app/latest?from=USD&to=CAD'))
-        .then(function(r) { if (!r.ok) throw new Error(); return r.json(); })
-        .then(function(d) { if (!d.rates||!d.rates.CAD) throw new Error(); return d.rates.CAD; });
-    })
-    // Source 4: allorigins proxy around open.er-api
-    .catch(function() {
-      return fetch('https://api.allorigins.win/get?url=' + encodeURIComponent('https://open.er-api.com/v6/latest/USD'))
-        .then(function(r) { return r.json(); })
-        .then(function(w) {
-          var d = JSON.parse(w.contents);
-          if (!d.rates||!d.rates.CAD) throw new Error();
-          return d.rates.CAD;
-        });
     });
 }
 
@@ -574,6 +587,7 @@ document.getElementById('hdr-date').innerHTML =
   '<br>Portfolio Management';
 
 loadState();
+loadWorkerUrl();
 setCurrency(displayCurrency);
 buildSetupPanel();
 buildMemberPanels();
@@ -930,13 +944,22 @@ function parseHist(json, ticker, quoteData) {
 // Legacy shim — used by wasHeldAt and other callers expecting parseYahoo
 function parseYahoo(json, ticker) { return parseHist(json, ticker, parseQuote(json, ticker)); }
 
-// Fetch helpers — each tries quote (5d) then history (2y) via same proxy path
+// Fetch via Cloudflare Worker proxy (adds CORS headers), with fallbacks
 function proxyFetch(url) {
-  // Try direct first, then allorigins, then corsproxy
-  return fetch(url, {headers:{Accept:'application/json'}})
-    .catch(function() { return fetch('https://api.allorigins.win/get?url='+encodeURIComponent(url)).then(function(r){if(!r.ok)throw new Error(r.status);return r.json();}).then(function(w){if(!w.contents)throw new Error('empty');var j=JSON.parse(w.contents);j._proxy='ao';return j;}); })
-    .catch(function() { return fetch('https://corsproxy.io/?'+encodeURIComponent(url),{headers:{Accept:'application/json'}}).then(function(r){if(!r.ok)throw new Error(r.status);return r.json();}).then(function(j){j._proxy='cp';return j;}); })
-    .then(function(r){ if(r.ok===false) throw new Error(r.status); return r._proxy ? r : r.json ? r.json() : r; });
+  // 1st: through your personal Cloudflare Worker
+  return fetch(proxyUrl(url), {headers:{Accept:'application/json'}})
+    .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    // 2nd fallback: allorigins public proxy
+    .catch(function() {
+      return fetch('https://api.allorigins.win/get?url='+encodeURIComponent(url))
+        .then(function(r){ if(!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function(w){ if(!w.contents) throw new Error('empty'); return JSON.parse(w.contents); });
+    })
+    // 3rd fallback: corsproxy.io
+    .catch(function() {
+      return fetch('https://corsproxy.io/?'+encodeURIComponent(url), {headers:{Accept:'application/json'}})
+        .then(function(r){ if(!r.ok) throw new Error(r.status); return r.json(); });
+    });
 }
 
 function fetchTicker(t) {
@@ -963,6 +986,20 @@ function fetchTickers(tickers, onProg) {
 // ═══════════════════════════════════════════════════════
 //  AUTO-REFRESH (every 60 seconds)
 // ═══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  CLOUDFLARE WORKER PROXY URL
+//  Replace the placeholder below with your own Worker URL after deploying.
+//  See worker.js for deployment instructions (takes ~2 minutes).
+// ═══════════════════════════════════════════════════════════════════════
+var WORKER_URL = 'YOUR_CLOUDFLARE_WORKER_URL';  // e.g. https://my-proxy.my-name.workers.dev
+
+function proxyUrl(targetUrl) {
+  if (!WORKER_URL || WORKER_URL === 'YOUR_CLOUDFLARE_WORKER_URL') {
+    return targetUrl; // no worker configured — try direct (works on localhost)
+  }
+  return WORKER_URL + '/proxy?url=' + encodeURIComponent(targetUrl);
+}
+
 var AUTO_INTERVAL = 60;
 var autoTimer = null, countdownTimer = null, nextRefreshAt = null;
 
@@ -1397,12 +1434,15 @@ function renderMemberResults(mid) {
       '</tbody></table></div>'+
 
     '<div class="charts-row">'+
+      '<div class="chart-box" style="border-top-color:'+hex+'"><div class="chart-box-title">Holdings Allocation by Stock / Fund ('+dc+')</div><canvas id="donut-ticker-'+mid+'" height="220"></canvas></div>'+
       '<div class="chart-box" style="border-top-color:'+hex+'"><div class="chart-box-title">Allocation by Institution ('+dc+')</div><canvas id="donut-inst-'+mid+'" height="220"></canvas></div>'+
+    '</div>'+
+    '<div class="charts-row">'+
       '<div class="chart-box" style="border-top-color:'+hex+'"><div class="chart-box-title">Allocation by Account Type ('+dc+')</div><canvas id="donut-acct-'+mid+'" height="220"></canvas></div>'+
+      '<div class="chart-box" style="border-top-color:'+hex+'"><div class="chart-box-title">Allocation by Currency ('+dc+')</div><canvas id="donut-cur-'+mid+'" height="220"></canvas></div>'+
     '</div>'+
     '<div class="charts-row">'+
       '<div class="chart-box" style="border-top-color:'+hex+'"><div class="chart-box-title">Return by Holding (%)</div><canvas id="bar-ret-'+mid+'" height="220"></canvas></div>'+
-      '<div class="chart-box" style="border-top-color:'+hex+'"><div class="chart-box-title">Allocation by Currency ('+dc+')</div><canvas id="donut-cur-'+mid+'" height="220"></canvas></div>'+
     '</div>'+
     '<div class="note">* Prices from Yahoo Finance (15-20 min delayed). Values in '+dc+'. % returns are currency-neutral (stock native). Annualized = CAGR. Not financial advice.</div>';
 
@@ -1489,6 +1529,15 @@ function buildInstBreakdown(rows) {
 }
 
 function renderMemberCharts(mid, rows, totVal, hex) {
+  // Ticker allocation — aggregate multiple lots of same ticker
+  var tickG = {};
+  rows.forEach(function(r) {
+    if (!tickG[r.ticker]) tickG[r.ticker] = 0;
+    tickG[r.ticker] += r.value;
+  });
+  var tL = Object.keys(tickG).sort(function(a,b){return tickG[b]-tickG[a];});
+  mkDonut('donut-ticker-'+mid, tL, tL.map(function(k){return tickG[k];}), TICKER_COLORS, totVal);
+
   var instG = groupBy(rows, 'institution');
   var iL = Object.keys(instG);
   mkDonut('donut-inst-'+mid, iL, iL.map(function(k){return totalVal(instG[k]);}), INST_COLORS, totVal);
@@ -1839,6 +1888,15 @@ function renderFamilyRoiChart(memberRois, familySeries) {
 
 function renderFamilyCharts(memberStats, acG, iG, famVal, allRows, famOvR) {
   var active = memberStats.filter(function(ms){return ms.rows && ms.rows.length>0 && totalVal(ms.rows)>0;});
+
+  // Ticker allocation — aggregate all lots across all family members by ticker
+  var tickG = {};
+  allRows.forEach(function(r) {
+    if (!tickG[r.ticker]) tickG[r.ticker] = 0;
+    tickG[r.ticker] += r.value;
+  });
+  var tL = Object.keys(tickG).sort(function(a,b){return tickG[b]-tickG[a];});
+  mkDonut('chart-fam-ticker', tL, tL.map(function(k){return tickG[k];}), TICKER_COLORS, famVal);
 
   mkDonut('chart-fam-donut', active.map(function(ms){return ms.member.name;}),
     active.map(function(ms){return totalVal(ms.rows);}), active.map(function(ms){return ms.color;}), famVal);
