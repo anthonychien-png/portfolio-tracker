@@ -405,6 +405,7 @@ tr:hover td{background:var(--surface2);}
     <div class="chart-box"><div class="chart-box-title">Return by Account Type (%)</div><canvas id="chart-fam-acct-bar" height="230"></canvas></div>
   </div>
   <div class="charts-row">
+    <div class="chart-box"><div class="chart-box-title">Annual Return by Year (%)</div><canvas id="chart-fam-annual" height="230"></canvas></div>
     <div class="chart-box"><div class="chart-box-title">Return by Member (%)</div><canvas id="chart-fam-bar" height="230"></canvas></div>
   </div>
 
@@ -1082,6 +1083,138 @@ function buildRoiSeries(txns, chartCur) {
   return keys.map(function(dk) { return { date: dk, pnl: points[dk] }; });
 }
 
+// ── Annual return bar chart ──────────────────────────────────────────────────
+// For each calendar year: total return % = (year-end value − year-start value) / year-start value
+// "year-start value" = last trading close of prior year × shares held, OR cost basis if purchased during the year.
+// "year-end value"   = last trading close of the year × shares held, OR today's price for current year.
+// Holdings purchased AFTER a year-end are excluded from that year.
+function buildAnnualReturns(txns, chartCur) {
+  var cur = chartCur || displayCurrency;
+  if (!txns.length) return [];
+
+  // Gather all years covered by history across all holdings
+  var yearSet = {};
+  var thisYear = new Date().getFullYear();
+
+  txns.forEach(function(h) {
+    var pd = state.prices[h.ticker];
+    if (!pd || !pd.history || !pd.history.length) return;
+    pd.history.forEach(function(pt) {
+      var y = new Date(pt.t * 1000).getFullYear();
+      yearSet[y] = true;
+    });
+    yearSet[thisYear] = true;
+  });
+
+  var years = Object.keys(yearSet).map(Number).sort();
+
+  var results = [];
+  years.forEach(function(yr) {
+    var startVal = 0, endVal = 0;
+
+    txns.forEach(function(h) {
+      var pd = state.prices[h.ticker];
+      if (!pd || !pd.history || !pd.history.length) return;
+      var stockCur  = pd.stockCurrency || 'USD';
+      var purMs     = new Date(h.purchaseDate).getTime();
+      var purYear   = new Date(h.purchaseDate).getFullYear();
+
+      // Skip if this holding wasn't purchased yet by end of this year
+      var yrEndMs = new Date(yr, 11, 31, 23, 59, 59).getTime();
+      if (purMs > yrEndMs) return;
+
+      // Find last trading day close of this year from history
+      var yrEndClose = null;
+      pd.history.forEach(function(pt) {
+        var ptY = new Date(pt.t * 1000).getFullYear();
+        if (ptY === yr) yrEndClose = pt.c; // keep overwriting → last bar of yr wins
+      });
+      // For current year, use live price
+      if (yr === thisYear) yrEndClose = pd.current;
+      if (yrEndClose === null) return;
+
+      // Find year-start value:
+      // If purchased during this year → cost basis (purchasePrice × shares in display cur)
+      // If purchased before this year → last trading close of PRIOR year
+      var yrStartClose = null;
+      if (purYear >= yr) {
+        // Purchased this year: use cost basis converted to display currency
+        yrStartClose = toStockCur(h.purchasePrice, h.purchaseCurrency || stockCur, cur);
+        startVal += yrStartClose * h.shares;
+      } else {
+        // Held from prior year: find last close of (yr-1)
+        pd.history.forEach(function(pt) {
+          var ptY = new Date(pt.t * 1000).getFullYear();
+          if (ptY === yr - 1) yrStartClose = pt.c;
+        });
+        if (yrStartClose === null) return; // no prior year data
+        startVal += toStockCur(yrStartClose, stockCur, cur) * h.shares;
+      }
+
+      endVal += toStockCur(yrEndClose, stockCur, cur) * h.shares;
+    });
+
+    if (startVal <= 0) return;
+    var pnl = endVal - startVal;
+    var pct = (pnl / startVal) * 100;
+    results.push({ year: yr, pct: pct, pnl: pnl, startVal: startVal, endVal: endVal });
+  });
+
+  return results;
+}
+
+// Annual return bar chart — shows % per year, tooltip has $ P&L
+function mkBarAnnual(id, data, color) {
+  if (charts[id]) charts[id].destroy();
+  var el = document.getElementById(id); if (!el) return;
+  if (!data || !data.length) return;
+  var labels = data.map(function(d){ return String(d.year); });
+  var vals   = data.map(function(d){ return +d.pct.toFixed(2); });
+  var pnls   = data.map(function(d){ return d.pnl; });
+  var bg     = vals.map(function(v){ return v >= 0 ? 'rgba(76,175,130,0.75)' : 'rgba(224,90,90,0.75)'; });
+  // If a single member colour is provided, use tinted versions of it
+  if (color) {
+    bg = vals.map(function(v) {
+      var base = v >= 0 ? color : '#E05A5A';
+      return base;
+    });
+  }
+  charts[id] = new Chart(el, {
+    type: 'bar',
+    data: { labels: labels, datasets: [{ data: vals, backgroundColor: bg, borderRadius: 3, borderSkipped: false }] },
+    options: {
+      responsive: true, maintainAspectRatio: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: {
+          label: function(ctx) {
+            var d = data[ctx.dataIndex];
+            return [
+              ' Return: ' + sign(ctx.parsed.y) + Math.abs(ctx.parsed.y).toFixed(2) + '%',
+              ' P&L:    ' + sign(d.pnl) + fmt(d.pnl),
+              ' Start:  ' + fmt(d.startVal),
+              ' End:    ' + fmt(d.endVal),
+            ];
+          }
+        }}
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { family:"'DM Mono',monospace", size: 11 }, color: '#857f75' } },
+        y: { grid: { color: '#dbd8d0' },
+             ticks: { font: { family:"'DM Mono',monospace", size: 10 }, color: '#857f75',
+                      callback: function(v) { return v + '%'; } },
+             afterDataLimits: function(axis) {
+               // add 15% headroom above/below so zero line and labels are visible
+               var range = axis.max - axis.min || 1;
+               axis.max += range * 0.15;
+               axis.min -= range * 0.15;
+             }
+           }
+      }
+    }
+  });
+}
+
 function hexAlpha(hex, alpha) {
   hex = hex.replace('#','');
   return 'rgba('+parseInt(hex.substring(0,2),16)+','+parseInt(hex.substring(2,4),16)+','+parseInt(hex.substring(4,6),16)+','+alpha+')';
@@ -1442,6 +1575,7 @@ function renderMemberResults(mid) {
       '<div class="chart-box" style="border-top-color:'+hex+'"><div class="chart-box-title">Allocation by Currency ('+dc+')</div><canvas id="donut-cur-'+mid+'" height="220"></canvas></div>'+
     '</div>'+
     '<div class="charts-row">'+
+      '<div class="chart-box" style="border-top-color:'+hex+'"><div class="chart-box-title">Annual Return by Year (%)</div><canvas id="bar-annual-'+mid+'" height="220"></canvas></div>'+
       '<div class="chart-box" style="border-top-color:'+hex+'"><div class="chart-box-title">Return by Holding (%)</div><canvas id="bar-ret-'+mid+'" height="220"></canvas></div>'+
     '</div>'+
     '<div class="note">* Prices from Yahoo Finance (15-20 min delayed). Values in '+dc+'. % returns are currency-neutral (stock native). Annualized = CAGR. Not financial advice.</div>';
@@ -1549,6 +1683,10 @@ function renderMemberCharts(mid, rows, totVal, hex) {
   mkDonut('donut-acct-'+mid, aL, aL.map(function(k){return totalVal(acG[k]);}), aL.map(function(k){return ACCT_COLORS[k]||'#6b6880';}), totVal);
 
   mkBar('bar-ret-'+mid, rows.map(function(r){return r.ticker+' ('+r.purchaseDate+')';}), rows.map(function(r){return r.overall!==null?+r.overall.toFixed(2):0;}), null);
+
+  // Annual return bar — uses full transaction list for this member (not display-currency-adjusted rows)
+  var annData = buildAnnualReturns(state.holdings[mid] || [], displayCurrency);
+  mkBarAnnual('bar-annual-'+mid, annData, hex);
 
   var curG = groupBy(rows, 'accountCurrency');
   var cL = Object.keys(curG);
@@ -1913,6 +2051,12 @@ function renderFamilyCharts(memberStats, acG, iG, famVal, allRows, famOvR) {
   var cL = Object.keys(curG);
   mkDonut('chart-fam-cur', cL, cL.map(function(k){return totalVal(curG[k]);}),
     cL.map(function(k){return CUR_COLORS[k]||'#6b6880';}), famVal);
+
+  // Annual return — aggregate all family holdings
+  var allTxns = [];
+  state.members.forEach(function(m) { allTxns = allTxns.concat(state.holdings[m.id]||[]); });
+  var famAnnData = buildAnnualReturns(allTxns, displayCurrency);
+  mkBarAnnual('chart-fam-annual', famAnnData, FAM_COLOR);
 
   mkBar('chart-fam-bar',
     active.map(function(ms){var ovR=portfolioOverall(ms.rows); return ms.member.name;}),
